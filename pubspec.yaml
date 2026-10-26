@@ -1,0 +1,28 @@
+name: pixelbox
+description: Émulateur Pixelbox (MIDP 2.0) écrit en Dart.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  archive: ^3.6.1
+  image: ^4.2.0
+  file_picker: ^8.1.2
+  cupertino_native_better: ^1.7.0
+  flutter_svg: ^2.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/
+    - assets/logo/
+    
