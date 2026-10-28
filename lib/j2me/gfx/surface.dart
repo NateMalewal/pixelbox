@@ -6,15 +6,29 @@ import 'font_atlas.dart';
 /// Image en mémoire : pixels ARGB 32 bits (0xAARRGGBB).
 class Surface {
   Surface(this.w, this.h, {int fill = 0x00000000})
-      : px = Uint32List(w * h)..fillRange(0, w * h, fill);
+      : px = Uint32List(w * h)..fillRange(0, w * h, fill),
+        _opaqueCache = (fill >>> 24) == 255;
 
   final int w;
   final int h;
   final Uint32List px;
+  bool? _opaqueCache;
+
+  bool get isOpaque {
+    final cached = _opaqueCache;
+    if (cached != null) return cached;
+    for (final pixel in px) {
+      if ((pixel >>> 24) != 255) return _opaqueCache = false;
+    }
+    return _opaqueCache = true;
+  }
+
+  void markModified() => _opaqueCache = null;
 
   Surface copy() {
     final s = Surface(w, h);
     s.px.setAll(0, px);
+    s._opaqueCache = _opaqueCache;
     return s;
   }
 }
@@ -89,6 +103,7 @@ class Gfx {
 
   void _put(int x, int y, int c) {
     if (x >= cx && x < cx2 && y >= cy && y < cy2) {
+      s.markModified();
       s.px[y * s.w + x] = c;
     }
   }
@@ -100,6 +115,7 @@ class Gfx {
     x1 = math.min(x1, cx2);
     y1 = math.min(y1, cy2);
     if (x0 >= x1) return;
+    s.markModified();
     for (var y = y0; y < y1; y++) {
       s.px.fillRange(y * s.w + x0, y * s.w + x1, color);
     }
@@ -146,7 +162,12 @@ class Gfx {
   }
 
   void fillTriangle(int x1, int y1, int x2, int y2, int x3, int y3) {
-    final ax = x1 + tx, ay = y1 + ty, bx = x2 + tx, by = y2 + ty, cxx = x3 + tx, cyy = y3 + ty;
+    final ax = x1 + tx,
+        ay = y1 + ty,
+        bx = x2 + tx,
+        by = y2 + ty,
+        cxx = x3 + tx,
+        cyy = y3 + ty;
     final minX = math.max(cx, math.min(ax, math.min(bx, cxx)));
     final maxX = math.min(cx2 - 1, math.max(ax, math.max(bx, cxx)));
     final minY = math.max(cy, math.min(ay, math.min(by, cyy)));
@@ -155,6 +176,7 @@ class Gfx {
         (qx - px) * (y - py) - (qy - py) * (x - px);
     final area = edge(ax, ay, bx, by, cxx, cyy);
     if (area == 0) return;
+    s.markModified();
     for (var y = minY; y <= maxY; y++) {
       for (var x = minX; x <= maxX; x++) {
         final w0 = edge(bx, by, cxx, cyy, x, y);
@@ -184,6 +206,7 @@ class Gfx {
     final y0 = y + ty;
     final rx = w / 2;
     final ry = h / 2;
+    s.markModified();
     for (var yy = math.max(y0, cy); yy < math.min(y0 + h, cy2); yy++) {
       for (var xx = math.max(x0, cx); xx < math.min(x0 + w, cx2); xx++) {
         final dx = (xx + 0.5 - x0 - rx) / rx;
@@ -202,6 +225,7 @@ class Gfx {
     final rx = w / 2;
     final ry = h / 2;
     final inner = math.max(0.0, 1 - 1.3 / math.min(rx, ry));
+    s.markModified();
     for (var yy = math.max(y0, cy); yy < math.min(y0 + h + 1, cy2); yy++) {
       for (var xx = math.max(x0, cx); xx < math.min(x0 + w + 1, cx2); xx++) {
         final dx = (xx + 0.5 - x0 - rx) / rx;
@@ -239,6 +263,7 @@ class Gfx {
     var pen = px + tx;
     final top = py + ty;
     final rgb = color & 0x00FFFFFF;
+    if (str.isNotEmpty) s.markModified();
     for (final u in str.codeUnits) {
       final g = font.glyph(u);
       if (g != null) {
@@ -264,7 +289,8 @@ class Gfx {
 
   /// Copie une région de [src] avec une des 8 transformations MIDP.
   /// Les coordonnées de destination sont celles du coin haut-gauche (avant translate).
-  void blit(Surface src, int sx, int sy, int sw, int sh, int dx, int dy, int tr) {
+  void blit(
+      Surface src, int sx, int sy, int sw, int sh, int dx, int dy, int tr) {
     // Région source bornée à l'image.
     if (sx < 0) {
       sw += sx;
@@ -289,6 +315,32 @@ class Gfx {
     final u0 = math.max(0, cx - ox);
     final u1 = math.min(dw, cx2 - ox);
 
+    // Chemin courant des jeux : copie sans transformation. Évite un switch
+    // par pixel, puis utilise la copie native quand la texture est opaque.
+    if (tr == 0) {
+      final copyOpaque = src.isOpaque;
+      for (var v = v0; v < v1; v++) {
+        final srcStart = (sy + v) * src.w + sx + u0;
+        final dstStart = (oy + v) * s.w + ox + u0;
+        final count = u1 - u0;
+        if (count <= 0) continue;
+        if (copyOpaque) {
+          s.px.setRange(dstStart, dstStart + count, src.px, srcStart);
+        } else {
+          for (var u = 0; u < count; u++) {
+            final c = src.px[srcStart + u];
+            final a = c >>> 24;
+            if (a == 0) continue;
+            final di = dstStart + u;
+            s.px[di] = a == 255 ? c : blendPx(s.px[di], c);
+          }
+        }
+      }
+      if (v0 < v1 && u0 < u1) s.markModified();
+      return;
+    }
+
+    s.markModified();
     for (var v = v0; v < v1; v++) {
       final row = (oy + v) * s.w + ox;
       for (var u = u0; u < u1; u++) {
@@ -346,7 +398,9 @@ class Gfx {
     return (px, py);
   }
 
-  void drawRgb(List<dynamic> rgb, int off, int scan, int x, int y, int w, int h, bool alpha) {
+  void drawRgb(List<dynamic> rgb, int off, int scan, int x, int y, int w, int h,
+      bool alpha) {
+    s.markModified();
     for (var j = 0; j < h; j++) {
       final yy = y + ty + j;
       if (yy < cy || yy >= cy2) continue;

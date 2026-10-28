@@ -12,5 +12,19 @@ import UIKit
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+    let channel = FlutterMethodChannel(
+      name: "pixelbox/display",
+      binaryMessenger: engineBridge.applicationRegistrar.messenger()
+    )
+    channel.setMethodCallHandler { call, result in
+      guard call.method == "maximumRefreshRate" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+      let screen = UIApplication.shared.connectedScenes
+        .compactMap { $0 as? UIWindowScene }
+        .first?.screen
+      result(screen?.maximumFramesPerSecond ?? UIScreen.main.maximumFramesPerSecond)
+    }
   }
 }

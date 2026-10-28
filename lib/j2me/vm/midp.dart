@@ -72,8 +72,50 @@ class Midp {
     }
     final c = current;
     if (c != null) {
+      // Si le jeu a déclaré des Command et un listener, les touches Menu et
+      // Retour leur sont réservées (comme sur un vrai téléphone).
+      if ((keyCode == -6 || keyCode == -7) && _hasCommands(c)) {
+        if (down) _fireCommand(c, left: keyCode == -6);
+        return;
+      }
       post(c, down ? 'keyPressed' : 'keyReleased', '(I)V', [keyCode]);
     }
+  }
+
+  bool _hasCommands(JObject c) {
+    final st = state(c);
+    return st.listener != null && st.commands.isNotEmpty;
+  }
+
+  /// Types de Command placés à droite : BACK, CANCEL, STOP, EXIT.
+  static bool _isRight(JObject cmd) {
+    final t = cmd.fields['type'];
+    return t == 2 || t == 3 || t == 6 || t == 7;
+  }
+
+  static int _priority(JObject cmd) => (cmd.fields['priority'] as int?) ?? 0;
+
+  void _fireCommand(JObject c, {required bool left}) {
+    final st = state(c);
+    final lefts = st.commands.where((x) => !_isRight(x)).toList()
+      ..sort((a, b) => _priority(a).compareTo(_priority(b)));
+    final rights = st.commands.where(_isRight).toList()
+      ..sort((a, b) => _priority(a).compareTo(_priority(b)));
+    JObject? cmd;
+    if (left) {
+      cmd = lefts.isNotEmpty ? lefts.first : null;
+    } else {
+      cmd = rights.isNotEmpty
+          ? rights.first
+          : (lefts.length > 1 ? lefts[1] : null);
+    }
+    if (cmd == null) return;
+    post(
+      st.listener!,
+      'commandAction',
+      '(L${_lcdui}Command;L${_lcdui}Displayable;)V',
+      [cmd, c],
+    );
   }
 
   /// Appelée à chaque tick de la VM, avant l'exécution des threads.
@@ -119,21 +161,47 @@ Surface? _decodeImage(Uint8List bytes) {
   final im = img.decodeImage(bytes);
   if (im == null) return null;
   final s = Surface(im.width, im.height);
-  final alpha = im.hasAlpha;
-  for (var y = 0; y < im.height; y++) {
-    for (var x = 0; x < im.width; x++) {
-      final p = im.getPixel(x, y);
-      final r = (p.rNormalized * 255).round();
-      final g = (p.gNormalized * 255).round();
-      final b = (p.bNormalized * 255).round();
-      final a = alpha ? (p.aNormalized * 255).round() : 255;
-      s.px[y * im.width + x] = (a << 24) | (r << 16) | (g << 8) | b;
+  final channels = im.data?.numChannels ?? 0;
+  final format = im.data?.format;
+  if (format == img.Format.uint8 && channels == 4) {
+    // Évite la création d'un objet Pixel et les conversions flottantes pour
+    // chaque canal. BGRA en octets correspond à ARGB dans Uint32List iOS.
+    final bgra = im.getBytes(order: img.ChannelOrder.bgra);
+    s.px.setAll(
+        0,
+        Uint32List.view(
+          bgra.buffer,
+          bgra.offsetInBytes,
+          im.width * im.height,
+        ));
+  } else if (format == img.Format.uint8 && channels == 3) {
+    final rgb = im.data!.toUint8List();
+    for (var i = 0, p = 0; i < s.px.length; i++, p += 3) {
+      s.px[i] = 0xFF000000 | (rgb[p] << 16) | (rgb[p + 1] << 8) | rgb[p + 2];
+    }
+  } else {
+    final alpha = im.hasAlpha;
+    for (var y = 0; y < im.height; y++) {
+      for (var x = 0; x < im.width; x++) {
+        final p = im.getPixel(x, y);
+        final r = (p.rNormalized * 255).round();
+        final g = (p.gNormalized * 255).round();
+        final b = (p.bNormalized * 255).round();
+        final a = alpha ? (p.aNormalized * 255).round() : 255;
+        s.px[y * im.width + x] = (a << 24) | (r << 16) | (g << 8) | b;
+      }
     }
   }
+  s.markModified();
   return s;
 }
 
-Midp registerMidp(Vm vm, FontAtlas atlas, void Function(Surface) onPresent) {
+Midp registerMidp(
+  Vm vm,
+  FontAtlas atlas,
+  void Function(Surface) onPresent, {
+  void Function(String resource, int elapsedMicros)? onImageDecoded,
+}) {
   final midp = Midp(vm, atlas, onPresent);
   final n = vm.natives;
 
@@ -149,6 +217,7 @@ Midp registerMidp(Vm vm, FontAtlas atlas, void Function(Surface) onPresent) {
   final gfxClass = vm.classes['${_lcdui}Graphics']!;
   final imageClass = vm.classes['${_lcdui}Image']!;
   final fontClass = vm.classes['${_lcdui}Font']!;
+  final decodedResources = <String, Surface>{};
 
   // Constantes.
   final canvasSt = vm.classes['${_lcdui}Canvas']!.statics;
@@ -372,12 +441,17 @@ Midp registerMidp(Vm vm, FontAtlas atlas, void Function(Surface) onPresent) {
     if (a[0] == null) throw JavaThrow('java/lang/NullPointerException');
     final name = a[0] as String;
     final key = name.startsWith('/') ? name.substring(1) : name;
+    final cached = decodedResources[key];
+    if (cached != null) return makeImage(cached);
     final bytes = vm.jar.files[key];
     if (bytes == null) throw JavaThrow('java/io/IOException', name);
+    final decodeWatch = Stopwatch()..start();
     final s = _decodeImage(bytes);
+    if (s != null) onImageDecoded?.call(name, decodeWatch.elapsedMicroseconds);
     if (s == null) {
       throw JavaThrow('java/io/IOException', 'image illisible : $name');
     }
+    decodedResources[key] = s;
     return makeImage(s);
   };
   n['$im.createImage(II)L$im;'] = (vm, t, a) => makeImage(
@@ -387,7 +461,14 @@ Midp registerMidp(Vm vm, FontAtlas atlas, void Function(Surface) onPresent) {
     final d = (a[0] as JArray).data as Int8List;
     final off = a[1] as int;
     final len = a[2] as int;
+    final decodeWatch = Stopwatch()..start();
     final s = _decodeImage(Uint8List.sublistView(d, off, off + len));
+    if (s != null) {
+      onImageDecoded?.call(
+        'Image.createImage(byte[], $len octets)',
+        decodeWatch.elapsedMicroseconds,
+      );
+    }
     if (s == null) {
       throw JavaThrow('java/lang/IllegalArgumentException', 'image illisible');
     }
@@ -405,6 +486,7 @@ Midp registerMidp(Vm vm, FontAtlas atlas, void Function(Surface) onPresent) {
       if (!alpha) c |= 0xFF000000;
       s.px[i] = c;
     }
+    s.markModified();
     return makeImage(s);
   };
   n['$im.getWidth()I'] = (vm, t, a) => surf(a[0]).w;
@@ -594,14 +676,18 @@ Midp registerMidp(Vm vm, FontAtlas atlas, void Function(Surface) onPresent) {
     return null;
   };
 
-  n['$gr.drawImage(L$im;III)Z'] = (vm, t, a) {
+  // MIDP 1.0 renvoie un boolean, MIDP 2.0 renvoie void : on accepte les deux.
+  Object? drawImage(Vm vm, JThread t, List<Object?> a) {
     final s = surf(a[1]);
     final gg = g(a);
     final (x, y) =
         gg.anchorImage(a[2] as int, a[3] as int, s.w, s.h, a[4] as int);
     gg.blit(s, 0, 0, s.w, s.h, x, y, 0);
     return 1;
-  };
+  }
+
+  n['$gr.drawImage(L$im;III)Z'] = drawImage;
+  n['$gr.drawImage(L$im;III)V'] = drawImage;
   n['$gr.drawRegion(L$im;IIIIIIII)V'] = (vm, t, a) {
     final s = surf(a[1]);
     final gg = g(a);

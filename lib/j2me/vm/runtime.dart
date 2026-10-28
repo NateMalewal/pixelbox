@@ -121,6 +121,12 @@ class JClass {
     return false;
   }
 
+  /// Clé de stockage d'un champ d'instance d'une classe du jeu : nom, type et
+  /// classe qui le déclare. Deux champs `a` de types différents (code obfusqué)
+  /// ou un champ qui en masque un autre du parent ne se mélangent donc plus.
+  static String instKey(String cls, String name, String desc) =>
+      '$name:$desc@$cls';
+
   /// Valeurs par défaut des champs d'instance (classe + parents).
   Map<String, Object?> fieldDefaults() {
     final cached = _defaults;
@@ -130,7 +136,9 @@ class JClass {
     final f = file;
     if (f != null) {
       for (final fld in f.fields) {
-        if (!fld.isStatic) m[fld.name] = defaultFor(fld.descriptor);
+        if (!fld.isStatic) {
+          m[instKey(name, fld.name, fld.descriptor)] = defaultFor(fld.descriptor);
+        }
       }
     }
     return _defaults = m;

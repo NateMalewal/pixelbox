@@ -17,11 +17,22 @@ class MRef {
   JMethod? direct;
 }
 
+/// Clé d'un champ statique. Les classes du jeu distinguent les champs de même
+/// nom mais de type différent (code obfusqué) ; les classes natives gardent le nom seul.
+String staticKey(JClass c, String name, String desc) =>
+    c.file != null ? '$name:$desc' : name;
+
 /// Référence de champ résolue.
 class FRef {
-  FRef(this.name, this.holder, this.wide);
+  FRef(this.name, this.holder, this.wide, this.skey, this.ikey);
 
   final String name;
+
+  /// Clé du champ statique dans holder.statics (nom + type pour les classes du jeu).
+  final String skey;
+
+  /// Clé du champ d'instance dans JObject.fields (nom + type + classe déclarante).
+  final String ikey;
 
   /// Pour les champs statiques : classe qui déclare le champ.
   final JClass? holder;
@@ -65,6 +76,10 @@ class Vm {
   final List<JThread> threads = [];
   final Map<String, String> _interned = {};
   final Stopwatch clock = Stopwatch()..start();
+  int lastTickInstructions = 0;
+  int lastTickDurationMicros = 0;
+  String lastMethodLabel = 'Démarrage';
+  int _tickInstructions = 0;
 
   int get nowMs => clock.elapsedMilliseconds;
 
@@ -112,7 +127,7 @@ class Vm {
 
     for (final f in cf.fields) {
       if (!f.isStatic) continue;
-      c.statics[f.name] = f.constantValueIndex != 0
+      c.statics[staticKey(c, f.name, f.descriptor)] = f.constantValueIndex != 0
           ? _constant(cf, f.constantValueIndex)
           : JClass.defaultFor(f.descriptor);
     }
@@ -171,6 +186,13 @@ class Vm {
     return c.methodCache[key] = r;
   }
 
+  String _describe(Object? o) {
+    if (o == null) return 'null';
+    if (o is JObject) return o.cls.name;
+    if (o is JArray) return o.type;
+    return '${o.runtimeType}';
+  }
+
   JClass classOf(Object o) {
     if (o is String) return stringClass;
     if (o is JObject) return o.cls;
@@ -184,7 +206,8 @@ class Vm {
     if (o is JObject) return o.cls.isSubclassOf(name);
     if (o is JArray) {
       return name.startsWith('[') &&
-          (o.type == name || (o.type.startsWith('[L') && name.startsWith('[L')));
+          (o.type == name ||
+              (o.type.startsWith('[L') && name.startsWith('[L')));
     }
     return false;
   }
@@ -214,7 +237,8 @@ class Vm {
       if (n is int && o.cls.name == 'java/lang/Integer') return n.toString();
       return '${o.cls.name.replaceAll('/', '.')}@${identityHashCode(o).toRadixString(16)}';
     }
-    if (o is JArray) return '${o.type}@${identityHashCode(o).toRadixString(16)}';
+    if (o is JArray)
+      return '${o.type}@${identityHashCode(o).toRadixString(16)}';
     return o.toString();
   }
 
@@ -232,7 +256,8 @@ class Vm {
   Frame newFrame(JMethod m, List<Object?> args) {
     final code = m.info?.code;
     if (code == null) {
-      throw JavaThrow('java/lang/AbstractMethodError', '${m.owner.name}.${m.name}${m.desc}');
+      throw JavaThrow('java/lang/AbstractMethodError',
+          '${m.owner.name}.${m.name}${m.desc}');
     }
     final lv = List<Object?>.filled(code.maxLocals + 1, null);
     var idx = 0;
@@ -296,17 +321,27 @@ class Vm {
 
   /// À appeler régulièrement (une fois par image environ).
   void tick({int budget = 300000}) {
+    final watch = Stopwatch()..start();
+    _tickInstructions = 0;
     preTick?.call();
-    final live = threads.where((t) => !t.done).toList();
-    if (live.isEmpty) return;
     final now = nowMs;
-    final per = budget ~/ live.length;
-    for (final t in live) {
-      if (t.wakeAt > now) continue;
+    final runnable = threads.where((t) => !t.done && t.wakeAt <= now).toList();
+    if (runnable.isEmpty) {
+      threads.removeWhere((t) => t.done);
+      lastTickInstructions = 0;
+      lastTickDurationMicros = watch.elapsedMicroseconds;
+      return;
+    }
+    final per = budget ~/ runnable.length;
+    final remainder = budget % runnable.length;
+    for (var i = 0; i < runnable.length; i++) {
+      final t = runnable[i];
       t.yielding = false;
-      run(t, per);
+      run(t, per + (i < remainder ? 1 : 0));
     }
     threads.removeWhere((t) => t.done);
+    lastTickInstructions = _tickInstructions;
+    lastTickDurationMicros = watch.elapsedMicroseconds;
   }
 
   // ---------------------------------------------------------- résolutions
@@ -322,10 +357,10 @@ class Vm {
     }) as MRef;
   }
 
-  JClass? _staticHolder(JClass c, String name) {
-    if (c.statics.containsKey(name)) return c;
+  JClass? _staticHolder(JClass c, String name, String desc) {
+    if (c.statics.containsKey(staticKey(c, name, desc))) return c;
     for (final i in c.interfaces) {
-      final r = _staticHolder(i, name);
+      final r = _staticHolder(i, name, desc);
       if (r != null) return r;
     }
     return null;
@@ -341,9 +376,26 @@ class Vm {
       final cls = requireClass(cf.classNameAt(e.a));
       JClass? holder;
       for (JClass? c = cls; c != null && holder == null; c = c.superClass) {
-        holder = _staticHolder(c, name);
+        holder = _staticHolder(c, name, desc);
       }
-      return FRef(name, holder, desc == 'J' || desc == 'D');
+      // Champ d'instance : on cherche la classe qui le déclare.
+      var ikey = name;
+      for (JClass? c = cls; c != null; c = c.superClass) {
+        final fl = c.file;
+        if (fl != null &&
+            fl.fields.any(
+                (x) => !x.isStatic && x.name == name && x.descriptor == desc)) {
+          ikey = JClass.instKey(c.name, name, desc);
+          break;
+        }
+      }
+      return FRef(
+        name,
+        holder,
+        desc == 'J' || desc == 'D',
+        holder == null ? name : staticKey(holder, name, desc),
+        ikey,
+      );
     }) as FRef;
   }
 
@@ -379,7 +431,14 @@ class Vm {
 
   JArray _newPrimArray(int atype, int n) {
     const types = {
-      4: '[Z', 5: '[C', 6: '[F', 7: '[D', 8: '[B', 9: '[S', 10: '[I', 11: '[J',
+      4: '[Z',
+      5: '[C',
+      6: '[F',
+      7: '[D',
+      8: '[B',
+      9: '[S',
+      10: '[I',
+      11: '[J',
     };
     return _arrayOfType(types[atype]!, n);
   }
@@ -417,11 +476,13 @@ class Vm {
     final trace = <String>[];
     while (t.frames.isNotEmpty) {
       final f = t.frames.last;
+      lastMethodLabel = '${f.method.owner.name}.${f.method.name}';
       final cf = f.method.owner.file!;
       for (final h in f.method.info!.code!.exceptions) {
         if (f.opPc >= h.startPc &&
             f.opPc < h.endPc &&
-            (h.catchType == 0 || ex.cls.isSubclassOf(cf.classNameAt(h.catchType)))) {
+            (h.catchType == 0 ||
+                ex.cls.isSubclassOf(cf.classNameAt(h.catchType)))) {
           f.sp = 0;
           f.stack[f.sp++] = ex;
           f.pc = h.handlerPc;
@@ -444,6 +505,7 @@ class Vm {
     outer:
     while (budget > 0 && !t.done && !t.yielding && t.frames.isNotEmpty) {
       final f = t.frames.last;
+      lastMethodLabel = '${f.method.owner.name}.${f.method.name}';
       final st = f.stack;
       final lv = f.locals;
       final code = f.code;
@@ -454,6 +516,7 @@ class Vm {
       try {
         while (budget > 0) {
           budget--;
+          _tickInstructions++;
           opPc = pc;
           final op = code[pc++];
 
@@ -484,7 +547,8 @@ class Vm {
             if (arr == null) throw JavaThrow('java/lang/NullPointerException');
             final a = arr as JArray;
             if (idx < 0 || idx >= a.data.length) {
-              throw JavaThrow('java/lang/ArrayIndexOutOfBoundsException', '$idx');
+              throw JavaThrow(
+                  'java/lang/ArrayIndexOutOfBoundsException', '$idx');
             }
             st[sp++] = a.data[idx];
             if (op == 0x2f || op == 0x31) st[sp++] = null;
@@ -504,7 +568,8 @@ class Vm {
             if (arr == null) throw JavaThrow('java/lang/NullPointerException');
             final a = arr as JArray;
             if (idx < 0 || idx >= a.data.length) {
-              throw JavaThrow('java/lang/ArrayIndexOutOfBoundsException', '$idx');
+              throw JavaThrow(
+                  'java/lang/ArrayIndexOutOfBoundsException', '$idx');
             }
             a.data[idx] = v;
             continue;
@@ -779,7 +844,8 @@ class Vm {
               {
                 sp--;
                 final b = st[sp] as int;
-                if (b == 0) throw JavaThrow('java/lang/ArithmeticException', '/ by zero');
+                if (b == 0)
+                  throw JavaThrow('java/lang/ArithmeticException', '/ by zero');
                 st[sp - 1] = ((st[sp - 1] as int) ~/ b).toSigned(32);
                 break;
               }
@@ -787,7 +853,8 @@ class Vm {
               {
                 sp -= 4;
                 final b = st[sp + 2] as int;
-                if (b == 0) throw JavaThrow('java/lang/ArithmeticException', '/ by zero');
+                if (b == 0)
+                  throw JavaThrow('java/lang/ArithmeticException', '/ by zero');
                 st[sp] = (st[sp] as int) ~/ b;
                 sp += 2;
                 break;
@@ -806,7 +873,8 @@ class Vm {
               {
                 sp--;
                 final b = st[sp] as int;
-                if (b == 0) throw JavaThrow('java/lang/ArithmeticException', '/ by zero');
+                if (b == 0)
+                  throw JavaThrow('java/lang/ArithmeticException', '/ by zero');
                 st[sp - 1] = (st[sp - 1] as int).remainder(b);
                 break;
               }
@@ -814,14 +882,16 @@ class Vm {
               {
                 sp -= 4;
                 final b = st[sp + 2] as int;
-                if (b == 0) throw JavaThrow('java/lang/ArithmeticException', '/ by zero');
+                if (b == 0)
+                  throw JavaThrow('java/lang/ArithmeticException', '/ by zero');
                 st[sp] = (st[sp] as int).remainder(b);
                 sp += 2;
                 break;
               }
             case 0x72:
               sp--;
-              st[sp - 1] = f32((st[sp - 1] as double).remainder(st[sp] as double));
+              st[sp - 1] =
+                  f32((st[sp - 1] as double).remainder(st[sp] as double));
               break;
             case 0x73:
               sp -= 4;
@@ -844,7 +914,8 @@ class Vm {
             // décalages
             case 0x78:
               sp--;
-              st[sp - 1] = ((st[sp - 1] as int) << ((st[sp] as int) & 31)).toSigned(32);
+              st[sp - 1] =
+                  ((st[sp - 1] as int) << ((st[sp] as int) & 31)).toSigned(32);
               break;
             case 0x79:
               sp--;
@@ -861,7 +932,8 @@ class Vm {
             case 0x7c:
               sp--;
               st[sp - 1] =
-                  (((st[sp - 1] as int) & 0xFFFFFFFF) >> ((st[sp] as int) & 31)).toSigned(32);
+                  (((st[sp - 1] as int) & 0xFFFFFFFF) >> ((st[sp] as int) & 31))
+                      .toSigned(32);
               break;
             case 0x7d:
               sp--;
@@ -1041,7 +1113,8 @@ class Vm {
             // champs
             case 0xb2:
               {
-                final fr = _fieldRef(f.method.owner, (code[pc] << 8) | code[pc + 1]);
+                final fr =
+                    _fieldRef(f.method.owner, (code[pc] << 8) | code[pc + 1]);
                 pc += 2;
                 final h = fr.holder;
                 if (h == null) {
@@ -1053,13 +1126,14 @@ class Vm {
                   f.opPc = opPc;
                   continue outer;
                 }
-                st[sp++] = h.statics[fr.name];
+                st[sp++] = h.statics[fr.skey];
                 if (fr.wide) st[sp++] = null;
                 break;
               }
             case 0xb3:
               {
-                final fr = _fieldRef(f.method.owner, (code[pc] << 8) | code[pc + 1]);
+                final fr =
+                    _fieldRef(f.method.owner, (code[pc] << 8) | code[pc + 1]);
                 pc += 2;
                 final h = fr.holder;
                 if (h == null) {
@@ -1072,28 +1146,32 @@ class Vm {
                   continue outer;
                 }
                 if (fr.wide) sp--;
-                h.statics[fr.name] = st[--sp];
+                h.statics[fr.skey] = st[--sp];
                 break;
               }
             case 0xb4:
               {
-                final fr = _fieldRef(f.method.owner, (code[pc] << 8) | code[pc + 1]);
+                final fr =
+                    _fieldRef(f.method.owner, (code[pc] << 8) | code[pc + 1]);
                 pc += 2;
                 final o = st[--sp];
-                if (o == null) throw JavaThrow('java/lang/NullPointerException');
-                st[sp++] = (o as JObject).fields[fr.name];
+                if (o == null)
+                  throw JavaThrow('java/lang/NullPointerException');
+                st[sp++] = (o as JObject).fields[fr.ikey];
                 if (fr.wide) st[sp++] = null;
                 break;
               }
             case 0xb5:
               {
-                final fr = _fieldRef(f.method.owner, (code[pc] << 8) | code[pc + 1]);
+                final fr =
+                    _fieldRef(f.method.owner, (code[pc] << 8) | code[pc + 1]);
                 pc += 2;
                 if (fr.wide) sp--;
                 final v = st[--sp];
                 final o = st[--sp];
-                if (o == null) throw JavaThrow('java/lang/NullPointerException');
-                (o as JObject).fields[fr.name] = v;
+                if (o == null)
+                  throw JavaThrow('java/lang/NullPointerException');
+                (o as JObject).fields[fr.ikey] = v;
                 break;
               }
 
@@ -1131,7 +1209,8 @@ class Vm {
                   m = mr.direct ??= findMethod(mr.cls, mr.name, mr.desc);
                 } else {
                   final recv = args[0];
-                  if (recv == null) throw JavaThrow('java/lang/NullPointerException');
+                  if (recv == null)
+                    throw JavaThrow('java/lang/NullPointerException');
                   if (recv is JArray && mr.name == 'clone') {
                     st[sp++] = recv.copy();
                     break;
@@ -1139,7 +1218,8 @@ class Vm {
                   m = findMethod(classOf(recv), mr.name, mr.desc);
                 }
                 if (m == null) {
-                  log('Méthode non implémentée : ${mr.cls.name}.${mr.name}${mr.desc}');
+                  log('Méthode non implémentée : ${mr.cls.name}.${mr.name}${mr.desc}'
+                      ' (récepteur : ${hasRecv ? _describe(args[0]) : "aucun"})');
                   throw JavaThrow(
                     'java/lang/NoSuchMethodError',
                     '${mr.cls.name}.${mr.name}${mr.desc}',
@@ -1153,7 +1233,9 @@ class Vm {
                   f.opPc = opPc;
                   final r = nf(this, t, args);
                   if (!identical(t.frames.last, f)) continue outer;
-                  if (mr.name == '<init>' && identical(mr.cls, stringClass) && r != null) {
+                  if (mr.name == '<init>' &&
+                      identical(mr.cls, stringClass) &&
+                      r != null) {
                     // new String(...) : l'objet provisoire est remplacé partout
                     // par la vraie chaîne.
                     final ph = args[0];
@@ -1197,7 +1279,8 @@ class Vm {
             // objets et tableaux
             case 0xbb:
               {
-                final cls = _classAt(f.method.owner, (code[pc] << 8) | code[pc + 1]);
+                final cls =
+                    _classAt(f.method.owner, (code[pc] << 8) | code[pc + 1]);
                 pc += 2;
                 if (ensureInit(t, cls)) {
                   f.pc = opPc;
@@ -1211,7 +1294,8 @@ class Vm {
             case 0xbc:
               {
                 final n = st[sp - 1] as int;
-                if (n < 0) throw JavaThrow('java/lang/NegativeArraySizeException', '$n');
+                if (n < 0)
+                  throw JavaThrow('java/lang/NegativeArraySizeException', '$n');
                 st[sp - 1] = _newPrimArray(code[pc++], n);
                 break;
               }
@@ -1221,7 +1305,8 @@ class Vm {
                     .classNameAt((code[pc] << 8) | code[pc + 1]);
                 pc += 2;
                 final n = st[sp - 1] as int;
-                if (n < 0) throw JavaThrow('java/lang/NegativeArraySizeException', '$n');
+                if (n < 0)
+                  throw JavaThrow('java/lang/NegativeArraySizeException', '$n');
                 final type = cname.startsWith('[') ? '[$cname' : '[L$cname;';
                 st[sp - 1] = JArray(type, List<Object?>.filled(n, null));
                 break;
@@ -1229,14 +1314,16 @@ class Vm {
             case 0xbe:
               {
                 final a = st[sp - 1];
-                if (a == null) throw JavaThrow('java/lang/NullPointerException');
+                if (a == null)
+                  throw JavaThrow('java/lang/NullPointerException');
                 st[sp - 1] = (a as JArray).data.length;
                 break;
               }
             case 0xbf:
               {
                 final ex = st[--sp];
-                if (ex == null) throw JavaThrow('java/lang/NullPointerException');
+                if (ex == null)
+                  throw JavaThrow('java/lang/NullPointerException');
                 f.pc = pc;
                 f.sp = sp;
                 f.opPc = opPc;
@@ -1300,7 +1387,8 @@ class Vm {
                       break;
                     }
                   default:
-                    throw JavaThrow('java/lang/Error', 'wide 0x${wop.toRadixString(16)}');
+                    throw JavaThrow(
+                        'java/lang/Error', 'wide 0x${wop.toRadixString(16)}');
                 }
                 break;
               }
@@ -1314,7 +1402,8 @@ class Vm {
                 for (var i = nd - 1; i >= 0; i--) {
                   dims[i] = st[--sp] as int;
                   if (dims[i] < 0) {
-                    throw JavaThrow('java/lang/NegativeArraySizeException', '${dims[i]}');
+                    throw JavaThrow(
+                        'java/lang/NegativeArraySizeException', '${dims[i]}');
                   }
                 }
                 st[sp++] = _multi(cname, dims, 0);

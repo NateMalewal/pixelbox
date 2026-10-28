@@ -6,13 +6,17 @@ import 'package:flutter/services.dart';
 import '../../j2me/key_codes.dart';
 import '../../theme.dart';
 
-/// Croix directionnelle : on peut glisser le doigt d'une direction à l'autre,
-/// les diagonales activent deux touches, le centre fait « OK ».
 class DPad extends StatefulWidget {
-  const DPad({super.key, required this.onKey, this.size = 190});
+  const DPad({
+    super.key,
+    required this.onKey,
+    this.size = 190,
+    this.hapticsEnabled = true,
+  });
 
   final void Function(J2meKey key, bool down) onKey;
   final double size;
+  final bool hapticsEnabled;
 
   @override
   State<DPad> createState() => _DPadState();
@@ -28,33 +32,59 @@ class _DPadState extends State<DPad> {
     final dist = v.distance;
     final next = <J2meKey>{};
 
-    if (dist <= r * 1.3) {
-      if (dist < r * 0.3) {
-        next.add(J2meKey.fire);
-      } else {
-        final n = v / dist;
-        if (n.dy < -0.38) next.add(J2meKey.up);
-        if (n.dy > 0.38) next.add(J2meKey.down);
-        if (n.dx < -0.38) next.add(J2meKey.left);
-        if (n.dx > 0.38) next.add(J2meKey.right);
-      }
+    if (dist > r * 0.95 || dist < r * 0.12) {
+      _apply(next);
+      return;
     }
+
+    final angle = math.atan2(v.dy, v.dx);
+    final sector = ((angle / (math.pi / 4)).round() + 8) % 8;
+
+    switch (sector) {
+      case 0:
+        next.add(J2meKey.right);
+      case 1:
+        next.add(J2meKey.num9);
+      case 2:
+        next.add(J2meKey.down);
+      case 3:
+        next.add(J2meKey.num7);
+      case 4:
+        next.add(J2meKey.left);
+      case 5:
+        next.add(J2meKey.num1);
+      case 6:
+        next.add(J2meKey.up);
+      case 7:
+        next.add(J2meKey.num3);
+    }
+
     _apply(next);
   }
 
   void _apply(Set<J2meKey> next) {
     final added = next.difference(_active);
     final removed = _active.difference(next);
+
     for (final k in removed) {
       widget.onKey(k, false);
     }
     for (final k in added) {
       widget.onKey(k, true);
     }
-    if (added.isNotEmpty) HapticFeedback.selectionClick();
+
+    if (added.isNotEmpty && widget.hapticsEnabled) {
+      HapticFeedback.selectionClick();
+    }
+
     if (added.isNotEmpty || removed.isNotEmpty) {
       setState(() => _active = next);
     }
+  }
+
+  void _release() {
+    _pointer = null;
+    _apply({});
   }
 
   @override
@@ -77,14 +107,10 @@ class _DPadState extends State<DPad> {
         if (e.pointer == _pointer) _update(e.localPosition);
       },
       onPointerUp: (e) {
-        if (e.pointer != _pointer) return;
-        _pointer = null;
-        _apply({});
+        if (e.pointer == _pointer) _release();
       },
       onPointerCancel: (e) {
-        if (e.pointer != _pointer) return;
-        _pointer = null;
-        _apply({});
+        if (e.pointer == _pointer) _release();
       },
       child: CustomPaint(
         size: Size.square(widget.size),
@@ -104,16 +130,16 @@ class _DPadPainter extends CustomPainter {
     final c = size.center(Offset.zero);
     final r = size.width / 2;
 
-    // Socle.
     canvas.drawCircle(
       c,
       r - 2,
       Paint()
         ..shader = const RadialGradient(
           center: Alignment(-0.3, -0.4),
-          colors: [Color(0xFF2A2142), Color(0xFF110C20)],
+          colors: [Palette.surfaceRaised, Palette.bg],
         ).createShader(Rect.fromCircle(center: c, radius: r)),
     );
+
     canvas.drawCircle(
       c,
       r - 2,
@@ -123,71 +149,64 @@ class _DPadPainter extends CustomPainter {
         ..color = Colors.white.withAlpha(36),
     );
 
-    // Flèches.
-    const arrows = <(J2meKey, double)>[
-      (J2meKey.up, 0),
-      (J2meKey.right, math.pi / 2),
-      (J2meKey.down, math.pi),
-      (J2meKey.left, -math.pi / 2),
-    ];
-    for (final (key, angle) in arrows) {
+    for (var i = 0; i < 8; i++) {
+      final angle = i * math.pi / 4;
+      final direction = Offset(math.cos(angle), math.sin(angle));
+      final key = switch (i) {
+        0 => J2meKey.right,
+        1 => J2meKey.num9,
+        2 => J2meKey.down,
+        3 => J2meKey.num7,
+        4 => J2meKey.left,
+        5 => J2meKey.num1,
+        6 => J2meKey.up,
+        _ => J2meKey.num3,
+      };
       final on = active.contains(key);
-      canvas.save();
-      canvas.translate(c.dx, c.dy);
-      canvas.rotate(angle);
 
-      final at = Offset(0, -r * 0.64);
+      final center = c + direction * (r * 0.58);
       if (on) {
         canvas.drawCircle(
-          at,
-          r * 0.2,
+          center,
+          r * 0.15,
           Paint()
             ..color = Palette.accent.withAlpha(150)
-            ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 14),
+            ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 12),
         );
       }
-      final w = r * 0.13;
-      final h = r * 0.12;
-      final path = Path()
-        ..moveTo(at.dx - w, at.dy + h / 2)
-        ..lineTo(at.dx, at.dy - h / 2)
-        ..lineTo(at.dx + w, at.dy + h / 2);
-      canvas.drawPath(
-        path,
-        Paint()
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 4.5
-          ..strokeCap = StrokeCap.round
-          ..strokeJoin = StrokeJoin.round
-          ..color = on ? Colors.white : Colors.white.withAlpha(140),
-      );
-      canvas.restore();
-    }
 
-    // Bouton central.
-    final fire = active.contains(J2meKey.fire);
-    if (fire) {
-      canvas.drawCircle(
-        c,
-        r * 0.3,
-        Paint()
-          ..color = Palette.accent.withAlpha(170)
-          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 16),
-      );
+      if (i.isOdd) {
+        final number = switch (i) { 1 => '9', 3 => '7', 5 => '1', _ => '3' };
+        final label = TextPainter(
+          text: TextSpan(
+            text: number,
+            style: TextStyle(
+              color: on ? Colors.white : Colors.white.withAlpha(150),
+              fontSize: r * 0.18,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          textDirection: TextDirection.ltr,
+        )..layout();
+        label.paint(canvas, center - Offset(label.width / 2, label.height / 2));
+      } else {
+        canvas.save();
+        canvas.translate(center.dx, center.dy);
+        canvas.rotate(angle + math.pi / 2);
+
+        final path = Path()
+          ..moveTo(0, -r * 0.12)
+          ..lineTo(-r * 0.10, r * 0.08)
+          ..lineTo(r * 0.10, r * 0.08)
+          ..close();
+
+        canvas.drawPath(
+          path,
+          Paint()..color = on ? Colors.white : Colors.white.withAlpha(135),
+        );
+        canvas.restore();
+      }
     }
-    canvas.drawCircle(
-      c,
-      r * 0.26,
-      Paint()..color = fire ? Palette.accent : Colors.white.withAlpha(20),
-    );
-    canvas.drawCircle(
-      c,
-      r * 0.26,
-      Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.5
-        ..color = Colors.white.withAlpha(fire ? 120 : 40),
-    );
   }
 
   @override

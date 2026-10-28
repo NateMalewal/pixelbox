@@ -1,0 +1,230 @@
+]633;E;for f in lib/audio/*.dart pubspec.yaml lib/j2me/emulator_session.dart\x3b do  echo "===== $f ====="\x3b cat "$f"\x3b echo\x3b done > pixelbox_audio.txt;18b1a21f-03be-4854-88b9-cad720399d1f]633;C===== lib/audio/*.dart =====
+
+===== pubspec.yaml =====
+name: pixelbox
+description: Émulateur Pixelbox (MIDP 2.0) écrit en Dart.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  archive: ^3.6.1
+  image: ^4.2.0
+  file_picker: ^8.1.2
+  cupertino_native_better: ^1.7.0
+  flutter_svg: ^2.2.0
+  path_provider: ^2.1.5
+  audioplayers: ^6.5.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/
+    - assets/logo/
+    
+
+===== lib/j2me/emulator_session.dart =====
+import 'dart:async';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+import 'vm/rms_storage.dart';
+import 'package:flutter/foundation.dart';
+
+import 'gfx/font_atlas.dart';
+import 'gfx/surface.dart';
+import 'jar_loader.dart';
+import 'key_codes.dart';
+import 'vm/midp.dart';
+import 'vm/natives.dart';
+import 'vm/java_library.dart';
+import 'vm/rms.dart';
+import 'vm/vm.dart';
+
+/// Une partie en cours : un MIDlet lancé depuis un JAR.
+class EmulatorSession {
+  EmulatorSession(this.package, this.midlet);
+
+  static const int width = Midp.width;
+  static const int height = Midp.height;
+
+  final JarPackage package;
+  final MidletInfo midlet;
+
+  final ValueNotifier<ui.Image?> frame = ValueNotifier(null);
+  final ValueNotifier<List<String>> log = ValueNotifier(const []);
+
+  final RmsBackend rms = RmsBackend();
+  final RmsStorage rmsStorage = RmsStorage();
+
+  Vm? vm;
+  Midp? midp;
+
+  Timer? _timer;
+  bool _disposed = false;
+  bool _decoding = false;
+
+  // Surface la plus récente à afficher après le décodage en cours.
+  Surface? _queuedSurface;
+
+  final Set<J2meKey> _held = {};
+
+  void _log(String line) {
+    debugPrint('[J2ME] $line');
+
+    if (_disposed) return;
+
+    final next = [...log.value, line];
+    log.value = next.length > 80 ? next.sublist(next.length - 80) : next;
+  }
+
+  Future<void> boot() async {
+    _log('Chargement des sauvegardes...');
+
+    await rmsStorage.load(rms);
+
+    if (_disposed) return;
+
+    _log('Préparation des polices...');
+
+    final atlas = await FontAtlas.build();
+    if (_disposed) return;
+
+    final machine = Vm(package, _log);
+
+    registerNatives(machine);
+    midp = registerMidp(machine, atlas, _present);
+    registerJavaLibrary(machine);
+    rms.onChanged = () {
+      rmsStorage.save(rms);
+    };
+    registerRms(machine, rms);
+
+    machine.onExit = () => _log('Le jeu a demandé à quitter.');
+    vm = machine;
+
+    try {
+      machine.startMidlet(midlet.className);
+    } on JavaThrow catch (e) {
+      _log('Démarrage impossible : ${e.cls} ${e.msg ?? ''}');
+      return;
+    }
+
+    if (_disposed) return;
+
+    // Fréquence logique inchangée : ne pas accélérer le jeu.
+    _timer = Timer.periodic(
+      const Duration(milliseconds: 16),
+      (_) => machine.tick(),
+    );
+  }
+
+  /// Présente la dernière surface disponible.
+  void _present(Surface surface) {
+    if (_disposed) return;
+
+    // Pendant le décodage, on garde uniquement la dernière surface.
+    // La conversion des pixels sera faite lorsqu'elle pourra être affichée.
+    if (_decoding) {
+      _queuedSurface = surface;
+      return;
+    }
+
+    final rgba = Uint8List(surface.w * surface.h * 4);
+    final output = rgba.buffer.asUint32List();
+    final pixels = surface.px;
+
+    for (var i = 0; i < pixels.length; i++) {
+      final pixel = pixels[i];
+
+      // ARGB -> RGBA en mémoire sur les plateformes little-endian.
+      output[i] = (pixel & 0xFF00FF00) |
+          ((pixel & 0xFF) << 16) |
+          ((pixel >> 16) & 0xFF);
+    }
+
+    _decode(rgba, surface.w, surface.h);
+  }
+
+  void _decode(Uint8List rgba, int width, int height) {
+    if (_disposed || _decoding) return;
+
+    _decoding = true;
+
+    ui.decodeImageFromPixels(
+      rgba,
+      width,
+      height,
+      ui.PixelFormat.rgba8888,
+      (image) {
+        if (_disposed) {
+          image.dispose();
+          _queuedSurface = null;
+          _decoding = false;
+          return;
+        }
+
+        final previous = frame.value;
+        frame.value = image;
+
+        if (previous != null) {
+          // Laisse le temps à Flutter de terminer l'affichage précédent.
+          Future.delayed(
+            const Duration(milliseconds: 200),
+            previous.dispose,
+          );
+        }
+
+        _decoding = false;
+
+        // Si plusieurs images sont arrivées, seule la dernière est traitée.
+        final queued = _queuedSurface;
+        _queuedSurface = null;
+
+        if (queued != null) {
+          _present(queued);
+        }
+      },
+    );
+  }
+
+  /// Appelé par l'interface à chaque appui ou relâchement.
+  void key(J2meKey key, bool down) {
+    if (_disposed) return;
+
+    if (down) {
+      if (!_held.add(key)) return;
+    } else {
+      if (!_held.remove(key)) return;
+    }
+
+    midp?.key(key.keyCode, down);
+  }
+
+  void dispose() {
+  if (_disposed) return;
+
+  _disposed = true;
+
+  rmsStorage.save(rms);
+
+  _timer?.cancel();
+  _timer = null;
+
+  _queuedSurface = null;
+  _held.clear();
+
+  frame.value?.dispose();
+  frame.dispose();
+  log.dispose();
+}
+}
+

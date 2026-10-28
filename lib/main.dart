@@ -2,17 +2,24 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'theme.dart';
-import 'ui/home_screen.dart';
+import 'ui/splash_screen.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
-  SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle.light);
-  runApp(const PixelboxApp());
+
+  SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+  ]);
+
+  SystemChrome.setSystemUIOverlayStyle(
+    SystemUiOverlayStyle.light,
+  );
+
+  runApp(const J2meApp());
 }
 
-class PixelboxApp extends StatelessWidget {
-  const PixelboxApp({super.key});
+class J2meApp extends StatelessWidget {
+  const J2meApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -20,7 +27,7 @@ class PixelboxApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'PixelBox',
       theme: buildTheme(),
-      home: const HomeScreen(),
+      home: const SplashScreen(),
     );
   }
 }
